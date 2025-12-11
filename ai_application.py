@@ -111,7 +111,7 @@ st.title("🚌 Bus Assistant (Public Version)")
 
 # Khởi tạo Gemini từ Secrets
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-2.5-pro')
+model = genai.GenerativeModel('gemini-2.0-flash')
 
 col1, col2 = st.columns([1.2, 0.8])
 
