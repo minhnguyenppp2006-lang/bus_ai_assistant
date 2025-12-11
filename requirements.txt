@@ -1,5 +1,5 @@
 streamlit
-googlemaps
+openrouteservice
 google-generativeai
 gTTS
 SpeechRecognition
