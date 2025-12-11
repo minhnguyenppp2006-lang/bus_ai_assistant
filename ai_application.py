@@ -111,7 +111,7 @@ st.title("🚌 Bus Assistant (Public Version)")
 
 # Khởi tạo Gemini từ Secrets
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-pro')
+model = genai.GenerativeModel('gemini-1.5-flash')
 
 col1, col2 = st.columns([1.2, 0.8])
 
@@ -175,4 +175,5 @@ with col2:
         st.chat_message("assistant").write(res)
         if auto_speak:
             a = text_to_speech(res)
+
             if a: st.audio(a, format='audio/mp3')
