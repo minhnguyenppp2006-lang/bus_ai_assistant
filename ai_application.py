@@ -1,7 +1,7 @@
 import streamlit as st
-import openrouteservice
-from openrouteservice import convert
+import googlemaps
 import google.generativeai as genai
+from datetime import datetime
 import speech_recognition as sr
 from gtts import gTTS
 from streamlit_mic_recorder import mic_recorder
@@ -9,79 +9,81 @@ import io
 import tempfile
 import os
 
-# --- CẤU HÌNH ---
-st.set_page_config(page_title="Bus Assistant (Free Version)", page_icon="🚌", layout="wide")
+# --- CẤU HÌNH TRANG ---
+st.set_page_config(page_title="Bus AI Pro", page_icon="🚌", layout="wide")
 
-# --- QUẢN LÝ SECRETS ---
+# --- QUẢN LÝ API KEY (MỚI) ---
+# Code sẽ tự động tìm key trong file secrets hệ thống
 try:
-    # Key bản đồ miễn phí (OpenRouteService)
-    ORS_API_KEY = st.secrets.get("ORS_API_KEY", "") 
-    # Key AI (Vẫn dùng Gemini vì nó free)
+    GOOGLE_MAPS_KEY = st.secrets["GOOGLE_MAPS_API_KEY"]
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
-except:
-    st.error("⚠️ Chưa cấu hình Secrets. Vui lòng thêm ORS_API_KEY và GEMINI_API_KEY.")
+except FileNotFoundError:
+    st.error("⚠️ Lỗi cấu hình: Chưa tìm thấy file secrets.toml (Nếu chạy local) hoặc Secrets (Nếu chạy trên Cloud).")
+    st.stop()
+except KeyError:
+    st.error("⚠️ Lỗi cấu hình: Thiếu API Key trong file secrets.")
     st.stop()
 
-if not ORS_API_KEY:
-    # Nếu chạy local mà chưa có secrets, nhập tạm vào đây để test
-    ORS_API_KEY = st.text_input("Nhập OpenRouteService Key (Miễn phí):", type="password")
+# --- SIDEBAR (Chỉ còn các tùy chọn cho User) ---
+with st.sidebar:
+    st.header("⚙️ Tùy chọn")
+    auto_speak = st.checkbox("Tự động đọc (TTS)", value=True)
+    st.divider()
+    st.header("🎯 Tiêu chí tối ưu")
+    optimize_mode = st.radio("Ưu tiên:", ["Thời gian ngắn nhất", "Ít đi bộ nhất", "Ít chuyển tuyến nhất"])
 
-# --- HÀM TÌM ĐỊA ĐIỂM & ĐƯỜNG ĐI (Dùng OpenRouteService) ---
-def get_coordinates(address, client):
-    """Đổi địa chỉ thành tọa độ (Geocoding)"""
+# --- CÁC HÀM LOGIC (GIỮ NGUYÊN) ---
+
+def get_routes(start, end, api_key):
+    # Logic cũ nhưng dùng api_key được truyền vào từ secrets
+    if not api_key: return "Thiếu API Key"
+    gmaps = googlemaps.Client(key=api_key)
+    now = datetime.now()
     try:
-        geocode = client.pelias_search(text=address)
-        if geocode['features']:
-            # Lấy tọa độ điểm đầu tiên tìm thấy [long, lat]
-            coords = geocode['features'][0]['geometry']['coordinates']
-            label = geocode['features'][0]['properties']['label']
-            return coords, label
-        return None, None
-    except Exception as e:
-        return None, str(e)
-
-def get_route_ors(start_addr, end_addr, client):
-    """Tìm đường đi bộ/xe (Vì ORS Free hạn chế dữ liệu Bus realtime)"""
-    # 1. Tìm tọa độ điểm đi/đến
-    start_coords, start_label = get_coordinates(start_addr, client)
-    end_coords, end_label = get_coordinates(end_addr, client)
-    
-    if not start_coords or not end_coords:
-        return f"Không tìm thấy địa điểm: {start_addr if not start_coords else end_addr}", None
-
-    try:
-        # 2. Tìm đường
-        # profile='foot-walking' (đi bộ) hoặc 'driving-car' (xe)
-        route = client.directions(
-            coordinates=[start_coords, end_coords],
-            profile='foot-walking', 
-            format='geojson',
-            language='vi'
+        directions_result = gmaps.directions(
+            start, end, mode="transit", transit_mode="bus", departure_time=now, alternatives=True, language="vi"
         )
-        
-        # 3. Trích xuất thông tin
-        summary = route['features'][0]['properties']['segments'][0]
-        distance_km = round(summary['distance'] / 1000, 2)
-        duration_min = round(summary['duration'] / 60)
-        
-        steps = summary['steps']
-        step_text = ""
-        for step in steps:
-            step_text += f"- {step['instruction']} ({step['distance']}m)\n"
-
-        return {
-            "start": start_label,
-            "end": end_label,
-            "distance": f"{distance_km} km",
-            "duration": f"{duration_min} phút đi bộ",
-            "steps": step_text,
-            "raw_steps": steps
-        }, None
-
+        return directions_result
     except Exception as e:
-        return None, f"Lỗi tìm đường: {str(e)}"
+        return f"Lỗi: {str(e)}"
 
-# --- CÁC HÀM ÂM THANH (GIỮ NGUYÊN) ---
+def analyze_routes(routes_data, mode):
+    # (Giữ nguyên logic phân tích như bài trước)
+    if not routes_data or isinstance(routes_data, str): return []
+    processed_routes = []
+    for route in routes_data:
+        leg = route['legs'][0]
+        duration_value = leg['duration']['value']
+        walking_distance = 0
+        transfers = 0
+        bus_names = []
+        next_bus_time = 0
+        
+        for step in leg['steps']:
+            if step['travel_mode'] == 'WALKING': walking_distance += step['distance']['value']
+            elif step['travel_mode'] == 'TRANSIT':
+                transfers += 1
+                bus_names.append(step['transit_details']['line'].get('short_name', 'Bus'))
+                if next_bus_time == 0: # Lấy chặng bus đầu
+                    dep = step['transit_details']['departure_time']['value']
+                    next_bus_time = max(0, int((datetime.fromtimestamp(dep) - datetime.now()).total_seconds() / 60))
+
+        processed_routes.append({
+            "summary": f"Xe {', '.join(bus_names)}",
+            "duration_text": leg['duration']['text'],
+            "duration_val": duration_value,
+            "walking_text": f"{walking_distance}m đi bộ",
+            "walking_val": walking_distance,
+            "transfers": transfers,
+            "wait_time": next_bus_time,
+            "raw_steps": leg['steps']
+        })
+
+    if mode == "Thời gian ngắn nhất": processed_routes.sort(key=lambda x: x['duration_val'])
+    elif mode == "Ít đi bộ nhất": processed_routes.sort(key=lambda x: x['walking_val'])
+    elif mode == "Ít chuyển tuyến nhất": processed_routes.sort(key=lambda x: x['transfers'])
+    return processed_routes
+
 def text_to_speech(text):
     try:
         tts = gTTS(text=text, lang='vi')
@@ -103,98 +105,74 @@ def process_audio(audio_bytes):
         return text
     except: return None
 
-# --- GIAO DIỆN ---
-st.title("🚌 Trợ Lý Di Chuyển (Bản Miễn Phí)")
-st.caption("Dữ liệu bản đồ từ OpenStreetMap & AI Gemini")
+# --- GIAO DIỆN CHÍNH ---
 
-# Setup Client
-if ORS_API_KEY:
-    ors_client = openrouteservice.Client(key=ORS_API_KEY)
+st.title("🚌 Bus Assistant (Public Version)")
 
+# Khởi tạo Gemini từ Secrets
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
+model = genai.GenerativeModel('gemini-pro')
 
-col1, col2 = st.columns([1, 1])
+col1, col2 = st.columns([1.2, 0.8])
 
-# CỘT 1: TÌM ĐƯỜNG
 with col1:
-    st.subheader("📍 Nhập lộ trình")
-    start_in = st.text_input("Điểm đi", "Chợ Bến Thành")
-    end_in = st.text_input("Điểm đến", "Dinh Độc Lập")
-    
-    if st.button("Tìm đường"):
-        if ORS_API_KEY:
-            with st.spinner("Đang tìm trên bản đồ mở..."):
-                data, err = get_route_ors(start_in, end_in, ors_client)
+    with st.form("search_form"):
+        c1, c2 = st.columns(2)
+        origin = c1.text_input("Điểm đi")
+        destination = c2.text_input("Điểm đến")
+        submitted = st.form_submit_button("Tìm đường 🚀")
+
+    if submitted and origin and destination:
+        with st.spinner("Đang xử lý..."):
+            # Gọi hàm với KEY lấy từ secrets
+            raw_data = get_routes(origin, destination, GOOGLE_MAPS_KEY)
+            
+            if isinstance(raw_data, str) and "Lỗi" in raw_data:
+                st.error(f"Hệ thống đang bảo trì hoặc quá tải. ({raw_data})")
+            elif raw_data:
+                routes = analyze_routes(raw_data, optimize_mode)
+                best = routes[0]
                 
-                if err:
-                    st.error(err)
-                elif data:
-                    st.success(f"Từ: {data['start']}\nĐến: {data['end']}")
-                    st.metric("Khoảng cách", data['distance'], data['duration'])
-                    
-                    # Context cho AI
-                    # MẸO: Vì ORS Free không có dữ liệu xe buýt tốt, ta nhờ AI "chém" dựa trên địa điểm
-                    context = f"""
-                    Người dùng muốn đi từ {data['start']} đến {data['end']}.
-                    Khoảng cách thực tế: {data['distance']}. Thời gian đi bộ: {data['duration']}.
-                    Chi tiết đường đi bộ: {data['steps']}
-                    """
-                    st.session_state['route_context'] = context
-                    st.session_state['location_data'] = data
-                    
-                    with st.expander("Xem hướng dẫn đi bộ"):
-                        st.text(data['steps'])
-        else:
-            st.warning("Vui lòng nhập API Key ORS.")
+                st.success(f"Nên đi: {best['summary']}")
+                st.metric("Thời gian chờ xe", f"{best['wait_time']} phút")
+                
+                context = f"Lộ trình: {best['summary']}, hết {best['duration_text']}. Đi bộ {best['walking_text']}."
+                st.session_state['route_context'] = context
+                
+                if auto_speak:
+                    aud = text_to_speech(f"Hãy đón {best['summary']}. Xe đến trong {best['wait_time']} phút.")
+                    if aud: st.audio(aud, format='audio/mp3', start_time=0)
+            else:
+                st.warning("Không tìm thấy tuyến xe nào.")
 
-# CỘT 2: CHAT AI TƯ VẤN XE BUÝT
 with col2:
-    st.subheader("🤖 AI Tư Vấn Xe Buýt")
+    st.subheader("💬 Trợ lý ảo")
+    chat_box = st.container(height=400)
     
-    # Hiển thị chat
     if "messages" not in st.session_state: st.session_state.messages = []
-    for m in st.session_state.messages: st.chat_message(m["role"]).write(m["content"])
-
-    # Input
-    mic = mic_recorder(start_prompt="🎤", stop_prompt="⏹️", key='mic_btn')
-    txt = st.chat_input("Hỏi về xe buýt tuyến này...")
     
-    final_input = txt
-    if mic and ('last_id' not in st.session_state or st.session_state.last_id != mic['id']):
-        st.session_state.last_id = mic['id']
-        t = process_audio(mic['audio']['bytes'])
-        if t: final_input = t
-
-    if final_input:
-        st.session_state.messages.append({"role":"user", "content":final_input})
-        st.chat_message("user").write(final_input)
+    with chat_box:
+        for m in st.session_state.messages: st.chat_message(m["role"]).write(m["content"])
         
-        # PROMPT ĐẶC BIỆT ĐỂ BÙ ĐẮP THIẾU DỮ LIỆU GOOGLE MAPS
+    text_in = st.chat_input("Hỏi tôi...")
+    mic_in = mic_recorder(start_prompt="🎤", stop_prompt="⏹️", key='mic')
+    
+    final_in = text_in
+    if mic_in and ('last_audio' not in st.session_state or st.session_state.last_audio != mic_in['id']):
+        st.session_state.last_audio = mic_in['id']
+        t = process_audio(mic_in['audio']['bytes'])
+        if t: final_in = t
+        
+    if final_in:
+        st.session_state.messages.append({"role":"user", "content":final_in})
+        st.chat_message("user").write(final_in)
+        
         ctx = st.session_state.get('route_context', '')
-        prompt = f"""
-        Bạn là trợ lý xe buýt thông minh tại Việt Nam.
-        Hiện tại hệ thống bản đồ chỉ cung cấp được dữ liệu đi bộ và khoảng cách.
+        # Prompt đơn giản hóa để tiết kiệm token
+        res = model.generate_content(f"Context: {ctx}. User: {final_in}. Answer short in Vietnamese.").text
         
-        Thông tin hiện có:
-        {ctx}
-        
-        NHIỆM VỤ CỦA BẠN:
-        1. Dựa vào kiến thức chung của bạn (đã được học từ internet), hãy ĐỀ XUẤT tuyến xe buýt phù hợp để đi giữa 2 địa điểm trên (Ví dụ ở TPHCM thì gợi ý xe số mấy, ở Hà Nội gợi ý xe nào).
-        2. Nếu khoảng cách gần (< 1km), khuyên người dùng đi bộ.
-        3. Trả lời câu hỏi: "{final_input}"
-        4. Trả lời ngắn gọn, thân thiện.
-        """
-        
-        try:
-            res = model.generate_content(prompt).text
-            st.session_state.messages.append({"role":"assistant", "content":res})
-            st.chat_message("assistant").write(res)
-            
-            # Đọc to
-            aud = text_to_speech(res)
-            if aud: st.audio(aud, format='audio/mp3', start_time=0)
-            
-        except Exception as e:
-            st.error(f"Lỗi AI: {e}")
-
+        st.session_state.messages.append({"role":"assistant", "content":res})
+        st.chat_message("assistant").write(res)
+        if auto_speak:
+            a = text_to_speech(res)
+            if a: st.audio(a, format='audio/mp3')
