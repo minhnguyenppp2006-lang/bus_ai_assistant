@@ -1,7 +1,8 @@
 streamlit
-openrouteservice
+googlemaps
 google-generativeai
 gTTS
 SpeechRecognition
 streamlit-mic-recorder
 pydub
+
